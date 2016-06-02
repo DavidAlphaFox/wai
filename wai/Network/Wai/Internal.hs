@@ -115,7 +115,7 @@ instance Show Request where
                 ,("requestHeaderRange",show requestHeaderRange)
                 ]
 
-
+-- 结果对象
 data Response
     = ResponseFile H.Status H.ResponseHeaders FilePath (Maybe FilePart)
     | ResponseBuilder H.Status H.ResponseHeaders Builder

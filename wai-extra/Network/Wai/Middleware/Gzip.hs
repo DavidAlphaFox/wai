@@ -52,7 +52,7 @@ data GzipSettings = GzipSettings
 
 data GzipFiles = GzipIgnore | GzipCompress | GzipCacheFolder FilePath
     deriving (Show, Eq, Read)
-
+-- 默认的Gzip压缩配置
 instance Default GzipSettings where
     def = GzipSettings GzipIgnore defaultCheckMime
 

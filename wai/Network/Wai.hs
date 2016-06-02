@@ -262,6 +262,8 @@ mapResponseStatus _ r@(ResponseRaw _ _) = r
 --     (putStrLn \"Cleaning up\")
 --     (respond $ responseLBS status200 [] \"Hello World\")
 -- @
+-- Application 是一个函数定义
+-- 接收请求对象，结果生成函数，最后生成结果
 type Application = Request -> (Response -> IO ResponseReceived) -> IO ResponseReceived
 
 
