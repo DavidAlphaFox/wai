@@ -7,7 +7,7 @@ module Network.Wai.Handler.WebSockets
     , runWebSockets
     ) where
 
-import              Control.Exception               (bracket)
+import              Control.Exception               (bracket, tryJust)
 import              Data.ByteString                 (ByteString)
 import qualified    Data.ByteString.Char8           as BC
 import qualified    Data.ByteString.Lazy            as BL
@@ -30,10 +30,10 @@ isWebSocketsReq req =
 -- WebSocket requests.
 --
 -- @
--- websocketsOr opts ws_app backup_app = \\req send_response ->
+-- websocketsOr opts ws_app backup_app = \\req respond ->
 --     __case__ 'websocketsApp' opts ws_app req __of__
 --         'Nothing'  -> backup_app req send_response
---         'Just' res -> send_response res
+--         'Just' res -> respond res
 -- @
 --
 -- For example, below is an 'Wai.Application' that sends @"Hello, client!"@ to
@@ -49,7 +49,7 @@ isWebSocketsReq req =
 --         'WS.sendTextData' conn ("Hello, client!" :: 'Data.Text.Text')
 --
 --     backupApp :: 'Wai.Application'
---     backupApp = 'Wai.respondLBS' 'Network.HTTP.Types.status400' [] "Not a WebSocket request"
+--     backupApp _ respond = respond $ 'Wai.responseLBS' 'Network.HTTP.Types.status400' [] "Not a WebSocket request"
 -- @
 websocketsOr :: WS.ConnectionOptions
              -> WS.ServerApp
@@ -95,8 +95,12 @@ runWebSockets :: WS.ConnectionOptions
               -> IO ByteString
               -> (ByteString -> IO ())
               -> IO a
-runWebSockets opts req app src sink = bracket mkStream WS.close (app . pc)
+runWebSockets opts req app src sink = bracket mkStream ensureClose (app . pc)
   where
+    ensureClose = tryJust onConnectionException . WS.close
+    onConnectionException :: WS.ConnectionException -> Maybe ()
+    onConnectionException WS.ConnectionClosed = Just ()
+    onConnectionException _                   = Nothing
     mkStream =
         WS.makeStream
             (do

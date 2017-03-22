@@ -41,6 +41,15 @@ embSpec = do
               assertStatus 200 req
               assertBody "index file" req
 
+        it "ssIndices works with trailing slashes" $ do
+            let testSettings = $(mkSettings mkEntries){
+                    ssIndices = [unsafeToPiece "index.html"]
+                }
+            embedSettings testSettings $ do
+              req <- request (setRawPathInfo defRequest "/foo/")
+              assertStatus 200 req
+              assertBody "index file in subdir" req
+
     describe "embedded, uncompressed entry" $ do
         it "too short" $ embed $ do
             req <- request (setRawPathInfo defRequest "e2.txt")

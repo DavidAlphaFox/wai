@@ -10,12 +10,15 @@ import Control.Applicative
 import Control.Concurrent.STM
 import qualified Control.Exception as E
 import Control.Monad (void, when)
+import Data.Bits
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder)
 import qualified Data.ByteString.Builder.Extra as B
 import Data.Maybe (isNothing)
-import Foreign.Ptr
-import Network.HPACK (setLimitForEncoding)
+import Data.Word (Word8, Word32)
+import Foreign.Ptr (Ptr, plusPtr)
+import Foreign.Storable (poke)
+import Network.HPACK (setLimitForEncoding, toHeaderTable)
 import Network.HTTP2
 import Network.HTTP2.Priority (isEmptySTM, dequeueSTM, Precedence)
 import Network.Wai
@@ -49,14 +52,14 @@ getStreamWindowSize :: Stream -> IO WindowSize
 getStreamWindowSize Stream{streamWindow} = atomically $ readTVar streamWindow
 
 {-# INLINE waitStreamWindowSize #-}
-waitStreamWindowSize :: Stream -> STM ()
-waitStreamWindowSize Stream{streamWindow} = do
+waitStreamWindowSize :: Stream -> IO ()
+waitStreamWindowSize Stream{streamWindow} = atomically $ do
     w <- readTVar streamWindow
     check (w > 0)
 
 {-# INLINE waitStreaming #-}
-waitStreaming :: TBQueue a -> STM ()
-waitStreaming tbq = do
+waitStreaming :: TBQueue a -> IO ()
+waitStreaming tbq = atomically $ do
     isEmpty <- isEmptyTBQueue tbq
     check (isEmpty == False)
 
@@ -92,7 +95,7 @@ frameSender ctx@Context{outputQ,controlQ,connectionWindow,encodeDynamicTable}
             O (_,pre,out) -> do
                 let strm = outputStream out
                 writeIORef (streamPrecedence strm) pre
-                off' <- whenReadyOrEnqueueAgain out off $ output out off
+                off' <- outputOrEnqueueAgain out off
                 case off' of
                     0                -> loop 0
                     _ | off' > 15872 -> flushN off' >> loop 0 -- fixme: hard-coding
@@ -119,22 +122,23 @@ frameSender ctx@Context{outputQ,controlQ,connectionWindow,encodeDynamicTable}
         Nothing  -> return ()
         Just siz -> setLimitForEncoding siz encodeDynamicTable
 
-    output (ONext strm curr mtbq) off0 lim = do
+    output out@(Output strm _ _ tell getH2D (ONext curr)) off0 lim = do
         -- Data frame payload
         let !buf = connWriteBuffer `plusPtr` off0
             !siz = connBufferSize - off0
         Next datPayloadLen mnext <- curr buf siz lim
-        off <- fillDataHeader strm off0 datPayloadLen mnext
-        maybeEnqueueNext strm mtbq mnext
+        off <- fillDataHeader strm off0 datPayloadLen mnext tell getH2D
+        maybeEnqueueNext out mnext
         return off
 
-    output (ORspn strm rspn ii) off0 lim = do
+    output out@(Output strm rspn ii tell getH2D ORspn) off0 lim = do
         -- Header frame and Continuation frame
-        let sid = streamNumber strm
-            endOfStream = case rspn of
+        let !sid = streamNumber strm
+            !endOfStream = case rspn of
                 RspnNobody _ _ -> True
                 _              -> False
-        kvlen <- headerContinue sid rspn endOfStream off0 ii
+        ths <- addNecessaryHeaders ctx rspn ii settings
+        kvlen <- headerContinue sid ths endOfStream off0
         off <- sendHeadersIfNecessary $ off0 + frameHeaderLength + kvlen
         case rspn of
             RspnNobody _ _ -> do
@@ -145,32 +149,51 @@ frameSender ctx@Context{outputQ,controlQ,connectionWindow,encodeDynamicTable}
                 let payloadOff = off + frameHeaderLength
                 Next datPayloadLen mnext <-
                     fillFileBodyGetNext conn ii payloadOff lim path mpart
-                off' <- fillDataHeader strm off datPayloadLen mnext
-                maybeEnqueueNext strm Nothing mnext
+                off' <- fillDataHeader strm off datPayloadLen mnext tell getH2D
+                maybeEnqueueNext out mnext
                 return off'
             RspnBuilder _ _ builder -> do
                 -- Data frame payload
                 let payloadOff = off + frameHeaderLength
                 Next datPayloadLen mnext <-
                     fillBuilderBodyGetNext conn ii payloadOff lim builder
-                off' <- fillDataHeader strm off datPayloadLen mnext
-                maybeEnqueueNext strm Nothing mnext
+                off' <- fillDataHeader strm off datPayloadLen mnext tell getH2D
+                maybeEnqueueNext out mnext
                 return off'
             RspnStreaming _ _ tbq -> do
                 let payloadOff = off + frameHeaderLength
                 Next datPayloadLen mnext <-
                     fillStreamBodyGetNext conn payloadOff lim tbq strm
-                off' <- fillDataHeader strm off datPayloadLen mnext
-                maybeEnqueueNext strm (Just tbq) mnext
+                off' <- fillDataHeader strm off datPayloadLen mnext tell getH2D
+                maybeEnqueueNext out mnext
                 return off'
 
-    whenReadyOrEnqueueAgain out off body = E.handle resetStream $ do
+    output out@(Output strm _ _ _ _ (OPush ths pid)) off0 lim = do
+        -- Creating a push promise header
+        -- Frame id should be associated stream id from the client.
+        let !sid = streamNumber strm
+        len <- pushPromise pid sid ths off0
+        off <- sendHeadersIfNecessary $ off0 + frameHeaderLength + len
+        output out{ outputType = ORspn }  off lim
+
+    output _ _ _ = undefined -- never reach
+
+    outputOrEnqueueAgain out off = E.handle resetStream $ do
         state <- readIORef $ streamState strm
         if isClosed state then
             return off
-          else case mtbq of
-            Just tbq -> checkStreaming tbq
-            _        -> checkStreamWindowSize
+          else case out of
+                 Output _ _ _ wait _ OWait -> do
+                     -- Checking if all push are done.
+                     let out' = out {
+                             outputHook = return ()
+                           , outputType = ORspn
+                           }
+                     forkAndEnqueueWhenReady wait outputQ out' mgr
+                     return off
+                 _ -> case mtbq of
+                        Just tbq -> checkStreaming tbq
+                        _        -> checkStreamWindowSize
       where
         strm = outputStream out
         mtbq = outputMaybeTBQueue out
@@ -189,7 +212,7 @@ frameSender ctx@Context{outputQ,controlQ,connectionWindow,encodeDynamicTable}
               else do
                 cws <- atomically $ readTVar connectionWindow -- not 0
                 let !lim = min cws sws
-                body lim
+                output out off lim
         resetStream e = do
             closed ctx strm (ResetByMe e)
             let !rst = resetFrame InternalError $ streamNumber strm
@@ -202,13 +225,11 @@ frameSender ctx@Context{outputQ,controlQ,connectionWindow,encodeDynamicTable}
     flushN :: Int -> IO ()
     flushN n = bufferIO connWriteBuffer n connSendAll
 
-    headerContinue sid rspn endOfStream off ii = do
-        let !s = rspnStatus rspn
-            !h = rspnHeaders rspn
+    headerContinue sid ths endOfStream off = do
         let !offkv = off + frameHeaderLength
         let !bufkv = connWriteBuffer `plusPtr` offkv
             !limkv = connBufferSize - offkv
-        (hs,kvlen) <- hpackEncodeHeader ctx bufkv limkv ii settings s h
+        (hs,kvlen) <- hpackEncodeHeader ctx bufkv limkv ths
         let flag0 = case hs of
                 [] -> setEndHeader defaultFlags
                 _  -> defaultFlags
@@ -221,24 +242,24 @@ frameSender ctx@Context{outputQ,controlQ,connectionWindow,encodeDynamicTable}
     !headerPayloadLim = connBufferSize - frameHeaderLength
 
     continue _   kvlen [] = return kvlen
-    continue sid kvlen hs = do
+    continue sid kvlen ths = do
         flushN $ kvlen + frameHeaderLength
         -- Now off is 0
-        (hs', kvlen') <- hpackEncodeHeaderLoop ctx bufHeaderPayload headerPayloadLim hs
-        when (hs == hs') $ E.throwIO $ ConnectionError CompressionError "cannot compress the header"
-        let flag = case hs' of
+        (ths', kvlen') <- hpackEncodeHeaderLoop ctx bufHeaderPayload headerPayloadLim ths
+        when (ths == ths') $ E.throwIO $ ConnectionError CompressionError "cannot compress the header"
+        let flag = case ths' of
                 [] -> setEndHeader defaultFlags
                 _  -> defaultFlags
         fillFrameHeader FrameContinuation kvlen' sid flag connWriteBuffer
-        continue sid kvlen' hs'
+        continue sid kvlen' ths'
 
     {-# INLINE maybeEnqueueNext #-}
     -- Re-enqueue the stream in the output queue.
-    maybeEnqueueNext :: Stream -> Maybe (TBQueue Sequence) -> Maybe DynaNext -> IO ()
-    maybeEnqueueNext _    _    Nothing     = return ()
-    maybeEnqueueNext strm mtbq (Just next) = enqueueOutput outputQ out
+    maybeEnqueueNext :: Output -> Maybe DynaNext -> IO ()
+    maybeEnqueueNext _   Nothing     = return ()
+    maybeEnqueueNext out (Just next) = enqueueOutput outputQ out'
       where
-        !out = ONext strm next mtbq
+        !out' = out { outputType = ONext next }
 
     {-# INLINE sendHeadersIfNecessary #-}
     -- Send headers if there is not room for a 1-byte data frame, and return
@@ -250,19 +271,50 @@ frameSender ctx@Context{outputQ,controlQ,connectionWindow,encodeDynamicTable}
           flushN off
           return 0
 
-    fillDataHeader strm off datPayloadLen mnext = do
+    fillDataHeader strm@Stream{streamWindow,streamNumber}
+                   off datPayloadLen mnext tell getH2D = do
         -- Data frame header
-        let !sid = streamNumber strm
+        mh2d <- getH2D
+        let (!trailers,!noTrailers) = case http2dataTrailers <$> mh2d of
+              Nothing -> ([], True)
+              Just ts -> (ts, null ts)
             !buf = connWriteBuffer `plusPtr` off
             !off' = off + frameHeaderLength + datPayloadLen
-            !done = isNothing mnext
-            flag | done      = setEndStream defaultFlags
-                 | otherwise = defaultFlags
-        fillFrameHeader FrameData datPayloadLen sid flag buf
-        when done $ closed ctx strm Finished
+            !noMoreBody = isNothing mnext
+            flag | noMoreBody && noTrailers = setEndStream defaultFlags
+                 | otherwise                = defaultFlags
+        fillFrameHeader FrameData datPayloadLen streamNumber flag buf
+        off'' <- handleEndOfBody noMoreBody off' noTrailers trailers
         atomically $ modifyTVar' connectionWindow (subtract datPayloadLen)
-        atomically $ modifyTVar' (streamWindow strm) (subtract datPayloadLen)
-        return off'
+        atomically $ modifyTVar' streamWindow (subtract datPayloadLen)
+        return off''
+      where
+        handleTrailers True off0 _        = return off0
+        handleTrailers _    off0 trailers = do
+            (ths,_) <- toHeaderTable trailers
+            kvlen <- headerContinue streamNumber ths True off0
+            sendHeadersIfNecessary $ off0 + frameHeaderLength + kvlen
+        handleEndOfBody True off0 noTrailers trailers = do
+            off1 <- handleTrailers noTrailers off0 trailers
+            void $ tell
+            closed ctx strm Finished
+            return off1
+        handleEndOfBody False off0 _ _ = return off0
+
+
+    pushPromise pid sid ths off = do
+        let !offsid = off + frameHeaderLength
+            !bufsid = connWriteBuffer `plusPtr` offsid
+        poke32 bufsid $ fromIntegral sid
+        let !offkv  = offsid + 4
+            !bufkv  = connWriteBuffer `plusPtr` offkv
+            !limkv  = connBufferSize - offkv
+        (_,kvlen) <- hpackEncodeHeader ctx bufkv limkv ths
+        let !flag = setEndHeader defaultFlags -- No EndStream flag
+            !buf = connWriteBuffer `plusPtr` off
+            !len = kvlen + 4
+        fillFrameHeader FramePushPromise len pid flag buf
+        return len
 
     {-# INLINE fillFrameHeader #-}
     fillFrameHeader ftyp len sid flag buf = encodeFrameHeaderBuf ftyp hinfo buf
@@ -470,3 +522,20 @@ mini :: Int -> Integer -> Int
 mini i n
   | fromIntegral i < n = i
   | otherwise          = fromIntegral n
+
+
+----------------------------------------------------------------
+
+poke32 :: Ptr Word8 -> Word32 -> IO ()
+poke32 ptr i = do
+    poke ptr w0
+    poke8 ptr 1 w1
+    poke8 ptr 2 w2
+    poke8 ptr 3 w3
+  where
+    w0 = fromIntegral ((i `shiftR` 24) .&. 0xff)
+    w1 = fromIntegral ((i `shiftR` 16) .&. 0xff)
+    w2 = fromIntegral ((i `shiftR`  8) .&. 0xff)
+    w3 = fromIntegral  (i              .&. 0xff)
+    poke8 :: Ptr Word8 -> Int -> Word8 -> IO ()
+    poke8 ptr0 n w = poke (ptr0 `plusPtr` n) w

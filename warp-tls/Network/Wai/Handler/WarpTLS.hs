@@ -55,7 +55,7 @@ import Data.Default.Class (def)
 import qualified Data.IORef as I
 import Data.Streaming.Network (bindPortTCP, safeRecv)
 import Data.Typeable (Typeable)
-import Network.Socket (Socket, sClose, withSocketsDo, SockAddr, accept)
+import Network.Socket (Socket, close, withSocketsDo, SockAddr, accept)
 import Network.Socket.ByteString (sendAll)
 import qualified Network.TLS as TLS
 import qualified Crypto.PubKey.DH as DH
@@ -234,7 +234,7 @@ runTLS :: TLSSettings -> Settings -> Application -> IO ()
 runTLS tset set app = withSocketsDo $
     bracket
         (bindPortTCP (getPort set) (getHost set))
-        sClose
+        close
         (\sock -> runTLSSocket tset set sock app)
 
 ----------------------------------------------------------------
@@ -309,12 +309,14 @@ getter tlsset@TLSSettings{..} sock params = do
     return (mkConn tlsset s params, sa)
 
 mkConn :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (Connection, Transport)
-mkConn tlsset s params = do
-    firstBS <- safeRecv s 4096
-    (if not (S.null firstBS) && S.head firstBS == 0x16 then
-        httpOverTls tlsset s firstBS params
-      else
-        plainHTTP tlsset s firstBS) `onException` sClose s
+mkConn tlsset s params = switch `onException` close s
+  where
+    switch = do
+        firstBS <- safeRecv s 4096
+        if not (S.null firstBS) && S.head firstBS == 0x16 then
+            httpOverTls tlsset s firstBS params
+          else
+            plainHTTP tlsset s firstBS
 
 ----------------------------------------------------------------
 
@@ -332,7 +334,7 @@ httpOverTls TLSSettings{..} s bs0 params = do
   where
     backend recvN = TLS.Backend {
         TLS.backendFlush = return ()
-      , TLS.backendClose = sClose s
+      , TLS.backendClose = close s
       , TLS.backendSend  = sendAll' s
       , TLS.backendRecv  = recvN
       }
@@ -342,7 +344,8 @@ httpOverTls TLSSettings{..} s bs0 params = do
         connSendMany         = TLS.sendData ctx . L.fromChunks
       , connSendAll          = sendall
       , connSendFile         = sendfile
-      , connClose            = close
+      , connClose            = close'
+      , connFree             = freeBuffer writeBuf
       , connRecv             = recv ref
       , connRecvBuf          = recvBuf ref
       , connWriteBuffer      = writeBuf
@@ -353,9 +356,8 @@ httpOverTls TLSSettings{..} s bs0 params = do
         sendfile fid offset len hook headers =
             readSendFile writeBuf bufferSize sendall fid offset len hook headers
 
-        close = freeBuffer writeBuf `finally`
-                void (tryIO $ TLS.bye ctx) `finally`
-                TLS.contextClose ctx
+        close' = void (tryIO $ TLS.bye ctx) `finally`
+                 TLS.contextClose ctx
 
         -- TLS version of recv with a cache for leftover input data.
         -- The cache is shared with recvBuf.
@@ -446,14 +448,22 @@ plainHTTP TLSSettings{..} s bs0 = case onInsecure of
                 }
         return (conn'', TCP)
     DenyInsecure lbs -> do
-        -- FIXME: what about HTTP/2?
-        -- http://tools.ietf.org/html/rfc2817#section-4.2
+        -- Listening port 443 but TLS records do not arrive.
+        -- We want to let the browser know that TLS is required.
+        -- So, we use 426.
+        --     http://tools.ietf.org/html/rfc2817#section-4.2
+        --     https://tools.ietf.org/html/rfc7231#section-6.5.15
+        -- FIXME: should we distinguish HTTP/1.1 and HTTP/2?
+        --        In the case of HTTP/2, should we send
+        --        GOAWAY + INADEQUATE_SECURITY?
+        -- FIXME: Content-Length:
+        -- FIXME: TLS/<version>
         sendAll s "HTTP/1.1 426 Upgrade Required\
         \r\nUpgrade: TLS/1.0, HTTP/1.1\
         \r\nConnection: Upgrade\
         \r\nContent-Type: text/plain\r\n\r\n"
         mapM_ (sendAll s) $ L.toChunks lbs
-        sClose s
+        close s
         throwIO InsecureConnectionDenied
 
 ----------------------------------------------------------------

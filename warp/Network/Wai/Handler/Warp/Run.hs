@@ -24,8 +24,8 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Streaming.Network (bindPortTCP)
 import Foreign.C.Error (Errno(..), eCONNABORTED)
 import GHC.IO.Exception (IOException(..))
-import Network (sClose, Socket)
-import Network.Socket (accept, withSocketsDo, SockAddr(SockAddrInet, SockAddrInet6), setSocketOption, SocketOption(..))
+import Network (Socket)
+import Network.Socket (close, accept, withSocketsDo, SockAddr(SockAddrInet, SockAddrInet6), setSocketOption, SocketOption(..))
 import qualified Network.Socket.ByteString as Sock
 import Network.Wai
 import Network.Wai.Handler.Warp.Buffer
@@ -35,6 +35,7 @@ import qualified Network.Wai.Handler.Warp.FdCache as F
 import qualified Network.Wai.Handler.Warp.FileInfoCache as I
 import Network.Wai.Handler.Warp.HTTP2 (http2, isHTTP2)
 import Network.Wai.Handler.Warp.Header
+import Network.Wai.Handler.Warp.IORef
 import Network.Wai.Handler.Warp.ReadInt
 import Network.Wai.Handler.Warp.Recv
 import Network.Wai.Handler.Warp.Request
@@ -63,7 +64,8 @@ socketConnection s = do
         connSendMany = Sock.sendMany s
       , connSendAll = sendall
       , connSendFile = sendFile s writeBuf bufferSize sendall
-      , connClose = sClose s >> freeBuffer writeBuf
+      , connClose = close s
+      , connFree = freeBuffer writeBuf
       , connRecv = receive s bufferPool
       , connRecvBuf = receiveBuf s
       , connWriteBuffer = writeBuf
@@ -104,7 +106,7 @@ runSettings :: Settings -> Application -> IO ()
 runSettings set app = withSocketsDo $
     bracket
         (bindPortTCP (settingsPort set) (settingsHost set))
-        sClose
+        close
         (\socket -> do
             setSocketCloseOnExec socket
             runSettingsSocket set socket app)
@@ -137,7 +139,7 @@ runSettingsSocket set socket app = do
         conn <- socketConnection s
         return (conn, sa)
 
-    closeListenSocket = sClose socket
+    closeListenSocket = close socket
 
 -- | The connection setup action would be expensive. A good example
 -- is initialization of TLS.
@@ -261,40 +263,53 @@ fork :: Settings
      -> Counter
      -> InternalInfo0
      -> IO ()
-fork set mkConn addr app counter ii0 = settingsFork set $ \ unmask ->
-    -- Run the connection maker to get a new connection, and ensure
-    -- that the connection is closed. If the mkConn call throws an
-    -- exception, we will leak the connection. If the mkConn call is
-    -- vulnerable to attacks (e.g., Slowloris), we do nothing to
-    -- protect the server. It is therefore vital that mkConn is well
-    -- vetted.
-    --
-    -- We grab the connection before registering timeouts since the
-    -- timeouts will be useless during connection creation, due to the
-    -- fact that async exceptions are still masked.
-    bracket mkConn closeConn $ \(conn, transport) ->
+fork set mkConn addr app counter ii0 = settingsFork set $ \unmask ->
+    -- Call the user-supplied on exception code if any
+    -- exceptions are thrown.
+    handle (settingsOnException set Nothing) .
+    -- Allocate a new IORef indicating whether the connection has been
+    -- closed, to avoid double-freeing a connection
+    withClosedRef $ \ref ->
+        -- Run the connection maker to get a new connection, and ensure
+        -- that the connection is closed. If the mkConn call throws an
+        -- exception, we will leak the connection. If the mkConn call is
+        -- vulnerable to attacks (e.g., Slowloris), we do nothing to
+        -- protect the server. It is therefore vital that mkConn is well
+        -- vetted.
+        --
+        -- We grab the connection before registering timeouts since the
+        -- timeouts will be useless during connection creation, due to the
+        -- fact that async exceptions are still masked.
+        bracket mkConn (cleanUp ref) (serve unmask ref)
+  where
+    withClosedRef inner = newIORef False >>= inner
+
+    closeConn ref conn = do
+        isClosed <- atomicModifyIORef' ref $ \x -> (True, x)
+        unless isClosed $ connClose conn
+
+    cleanUp ref (conn, _) = closeConn ref conn `finally` connFree conn
 
     -- We need to register a timeout handler for this thread, and
-    -- cancel that handler as soon as we exit.
-    bracket (T.registerKillThread (timeoutManager0 ii0)) T.cancel $ \th ->
-
-    let ii1 = toInternalInfo1 ii0 th
-        -- We now have fully registered a connection close handler
-        -- in the case of all exceptions, so it is safe to one
-        -- again allow async exceptions.
-    in unmask .
-       -- Call the user-supplied on exception code if any
-       -- exceptions are thrown.
-       handle (settingsOnException set Nothing) .
-
-       -- Call the user-supplied code for connection open and close events
-       bracket (onOpen addr) (onClose addr) $ \goingon ->
-
-       -- Actually serve this connection.
-       -- bracket with closeConn above ensures the connection is closed.
-       when goingon $ serveConnection conn ii1 addr transport set app
-  where
-    closeConn (conn, _transport) = connClose conn
+    -- cancel that handler as soon as we exit. We additionally close
+    -- the connection immediately in case the child thread catches the
+    -- async exception or performs some long-running cleanup action.
+    serve unmask ref (conn, transport) = bracket register cancel $ \th -> do
+        let ii1 = toInternalInfo1 ii0 th
+        -- We now have fully registered a connection close handler in
+        -- the case of all exceptions, so it is safe to one again
+        -- allow async exceptions.
+        unmask .
+            -- Call the user-supplied code for connection open and
+            -- close events
+           bracket (onOpen addr) (onClose addr) $ \goingon ->
+           -- Actually serve this connection.  bracket with closeConn
+           -- above ensures the connection is closed.
+           when goingon $ serveConnection conn ii1 addr transport set app
+      where
+        register = T.registerKillThread (timeoutManager0 ii0)
+                                        (closeConn ref conn)
+        cancel   = T.cancel
 
     onOpen adr    = increase counter >> settingsOnOpen  set adr
     onClose adr _ = decrease counter >> settingsOnClose set adr

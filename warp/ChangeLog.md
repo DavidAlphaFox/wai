@@ -1,5 +1,31 @@
+## 3.2.11.1
+
+* Move exception handling to top of thread (fixes
+  [#613](https://github.com/yesodweb/wai/issues/613))
+
+## 3.2.11
+
+* Fixing 10 HTTP2 bugs pointed out by h2spec v2.
+
+## 3.2.10
+
+* Add `connFree` to `Connection`. Close socket connections on timeout triggered. Timeout exceptions extend from `SomeAsyncException`. [#602](https://github.com/yesodweb/wai/pull/602) [#605](https://github.com/yesodweb/wai/pull/605)
+
+## 3.2.9
+
+* Fixing a space leak. [#586](https://github.com/yesodweb/wai/pull/586)
+
+## 3.2.8
+
+* Fixing HTTP2 requestBodyLength. [#573](https://github.com/yesodweb/wai/pull/573)
+* Making HTTP/2 :path optional for the CONNECT method. [#572](https://github.com/yesodweb/wai/pull/572)
+* Adding new APIs for HTTP/2 trailers: http2dataTrailers and modifyHTTP2Data [#566](https://github.com/yesodweb/wai/pull/566)
+
 ## 3.2.7
 
+* Adding new APIs for HTTP/2 server push: getHTTP2Data and setHTTP2Data [#510](https://github.com/yesodweb/wai/pull/510)
+* Better accept(2) error handling [#553](https://github.com/yesodweb/wai/pull/553)
+* Adding getGracefulShutdownTimeout.
 * Add {test,}withApplicationSettings [#531](https://github.com/yesodweb/wai/pull/531)
 
 ## 3.2.6

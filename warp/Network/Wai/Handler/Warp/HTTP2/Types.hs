@@ -11,7 +11,7 @@ import Control.Applicative ((<$>),(<*>))
 import Control.Concurrent (forkIO)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, bracket)
-import Control.Monad (void)
+import Control.Monad (void, forM_)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IntMap.Strict (IntMap, IntMap)
@@ -68,17 +68,23 @@ rspnHeaders (RspnStreaming _ t _)    = t
 rspnHeaders (RspnBuilder   _ t _)    = t
 rspnHeaders (RspnFile      _ t _ _ ) = t
 
-data Output = ORspn !Stream !Rspn !InternalInfo
-            | ONext !Stream !DynaNext !(Maybe (TBQueue Sequence))
+data Output = Output {
+    outputStream :: !Stream
+  , outputRspn   :: !Rspn
+  , outputII     :: !InternalInfo
+  , outputHook   :: IO () -- OPush: wait for done, O*: telling done
+  , outputH2Data :: IO (Maybe HTTP2Data)
+  , outputType   :: !OutputType
+  }
 
-outputStream :: Output -> Stream
-outputStream (ORspn strm _ _) = strm
-outputStream (ONext strm _ _) = strm
+data OutputType = ORspn
+                | OWait
+                | OPush !TokenHeaderList !StreamId -- associated stream id from client
+                | ONext !DynaNext
 
 outputMaybeTBQueue :: Output -> Maybe (TBQueue Sequence)
-outputMaybeTBQueue (ORspn _ (RspnStreaming _ _ tbq) _) = Just tbq
-outputMaybeTBQueue (ORspn _ _ _)                       = Nothing
-outputMaybeTBQueue (ONext _ _ mtbq)                    = mtbq
+outputMaybeTBQueue (Output _ (RspnStreaming _ _ tbq) _ _ _ _) = Just tbq
+outputMaybeTBQueue _                                          = Nothing
 
 data Control = CFinish
              | CGoaway    !ByteString
@@ -96,6 +102,7 @@ data Sequence = SFinish
 
 -- | The context for HTTP/2 connection.
 data Context = Context {
+  -- HTTP/2 settings received from a browser
     http2settings      :: !(IORef Settings)
   , firstSettings      :: !(IORef Bool)
   , streamTable        :: !StreamTable
@@ -106,12 +113,14 @@ data Context = Context {
   --   frames that might follow". This field is used to implement
   --   this requirement.
   , continued          :: !(IORef (Maybe StreamId))
-  , currentStreamId    :: !(IORef StreamId)
+  , clientStreamId     :: !(IORef StreamId)
+  , serverStreamId     :: !(IORef StreamId)
   , inputQ             :: !(TQueue Input)
   , outputQ            :: !(PriorityTree Output)
   , controlQ           :: !(TQueue Control)
   , encodeDynamicTable :: !DynamicTable
   , decodeDynamicTable :: !DynamicTable
+  -- the connection window for data from a server to a browser.
   , connectionWindow   :: !(TVar WindowSize)
   }
 
@@ -124,6 +133,7 @@ newContext = Context <$> newIORef defaultSettings
                      <*> newIORef 0
                      <*> newIORef 0
                      <*> newIORef Nothing
+                     <*> newIORef 0
                      <*> newIORef 0
                      <*> newTQueueIO
                      <*> newPriorityTree
@@ -147,6 +157,9 @@ data OpenState =
   | NoBody (TokenHeaderList,ValueTable) !Priority
   | HasBody (TokenHeaderList,ValueTable) !Priority
   | Body !(TQueue ByteString)
+         !(Maybe Int) -- received Content-Length
+                      -- compared the body length for error checking
+         !(IORef Int) -- actual body length
 
 data ClosedCode = Finished
                 | Killed
@@ -159,6 +172,7 @@ data StreamState =
   | Open !OpenState
   | HalfClosed
   | Closed !ClosedCode
+  | Reserved
 
 isIdle :: StreamState -> Bool
 isIdle Idle = True
@@ -181,17 +195,15 @@ instance Show StreamState where
     show Open{}      = "Open"
     show HalfClosed  = "HalfClosed"
     show (Closed e)  = "Closed: " ++ show e
+    show Reserved    = "Reserved"
 
 ----------------------------------------------------------------
 
 data Stream = Stream {
-    streamNumber        :: !StreamId
-  , streamState         :: !(IORef StreamState)
-  -- Next two fields are for error checking.
-  , streamContentLength :: !(IORef (Maybe Int))
-  , streamBodyLength    :: !(IORef Int)
-  , streamWindow        :: !(TVar WindowSize)
-  , streamPrecedence    :: !(IORef Precedence)
+    streamNumber     :: !StreamId
+  , streamState      :: !(IORef StreamState)
+  , streamWindow     :: !(TVar WindowSize)
+  , streamPrecedence :: !(IORef Precedence)
   }
 
 instance Show Stream where
@@ -199,10 +211,17 @@ instance Show Stream where
 
 newStream :: StreamId -> WindowSize -> IO Stream
 newStream sid win = Stream sid <$> newIORef Idle
-                               <*> newIORef Nothing
-                               <*> newIORef 0
                                <*> newTVarIO win
                                <*> newIORef defaultPrecedence
+
+newPushStream :: Context -> WindowSize -> Precedence -> IO Stream
+newPushStream Context{serverStreamId} win pre = do
+    sid <- atomicModifyIORef' serverStreamId inc2
+    Stream sid <$> newIORef Reserved
+               <*> newTVarIO win
+               <*> newIORef pre
+  where
+    inc2 x = let !x' = x + 2 in (x', x')
 
 ----------------------------------------------------------------
 
@@ -237,11 +256,16 @@ remove (StreamTable ref) k = atomicModifyIORef' ref $ \m ->
 search :: StreamTable -> M.Key -> IO (Maybe Stream)
 search (StreamTable ref) k = M.lookup k <$> readIORef ref
 
+updateAllStreamWindow :: (WindowSize -> WindowSize) -> StreamTable -> IO ()
+updateAllStreamWindow adst (StreamTable ref) = do
+    strms <- M.elems <$> readIORef ref
+    forM_ strms $ \strm -> atomically $ modifyTVar (streamWindow strm) adst
+
 {-# INLINE forkAndEnqueueWhenReady #-}
-forkAndEnqueueWhenReady :: STM () -> PriorityTree Output -> Output -> Manager -> IO ()
+forkAndEnqueueWhenReady :: IO () -> PriorityTree Output -> Output -> Manager -> IO ()
 forkAndEnqueueWhenReady wait outQ out mgr = bracket setup teardown $ \_ ->
     void . forkIO $ do
-        atomically wait
+        wait
         enqueueOutput outQ out
   where
     setup = addMyId mgr
@@ -257,3 +281,57 @@ enqueueOutput outQ out = do
 {-# INLINE enqueueControl #-}
 enqueueControl :: TQueue Control -> Control -> IO ()
 enqueueControl ctlQ ctl = atomically $ writeTQueue ctlQ ctl
+
+----------------------------------------------------------------
+
+-- | HTTP/2 specific data.
+--
+--   Since: 3.2.7
+data HTTP2Data = HTTP2Data {
+    -- | Accessor for 'PushPromise' in 'HTTP2Data'.
+    --
+    --   Since: 3.2.7
+      http2dataPushPromise :: [PushPromise]
+    --   Since: 3.2.8
+    , http2dataTrailers :: H.ResponseHeaders
+    } deriving (Eq,Show)
+
+-- | Default HTTP/2 specific data.
+--
+--   Since: 3.2.7
+defaultHTTP2Data :: HTTP2Data
+defaultHTTP2Data = HTTP2Data [] []
+
+-- | HTTP/2 push promise or sever push.
+--
+--   Since: 3.2.7
+data PushPromise = PushPromise {
+    -- | Accessor for a URL path in 'PushPromise'.
+    --   E.g. \"\/style\/default.css\".
+    --
+    --   Since: 3.2.7
+      promisedPath            :: ByteString
+    -- | Accessor for 'FilePath' in 'PushPromise'.
+    --   E.g. \"FILE_PATH/default.css\".
+    --
+    --   Since: 3.2.7
+    , promisedFile            :: FilePath
+    -- | Accessor for 'H.ResponseHeaders' in 'PushPromise'
+    --   \"content-type\" must be specified.
+    --   Default value: [].
+    --
+    --
+    --   Since: 3.2.7
+    , promisedResponseHeaders :: H.ResponseHeaders
+    -- | Accessor for 'Weight' in 'PushPromise'.
+    --    Default value: 16.
+    --
+    --   Since: 3.2.7
+    , promisedWeight          :: Weight
+    } deriving (Eq,Ord,Show)
+
+-- | Default push promise.
+--
+--   Since: 3.2.7
+defaultPushPromise :: PushPromise
+defaultPushPromise = PushPromise "" "" [] 16

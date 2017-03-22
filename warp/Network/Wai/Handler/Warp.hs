@@ -70,6 +70,7 @@ module Network.Wai.Handler.Warp (
   , setSlowlorisSize
   , setHTTP2Disabled
   , setLogger
+  , setServerPushLogger
   , setGracefulShutdownTimeout
     -- ** Getters
   , getPort
@@ -99,6 +100,22 @@ module Network.Wai.Handler.Warp (
   , openFreePort
     -- * Version
   , warpVersion
+    -- * HTTP/2
+    -- ** HTTP2 data
+  , HTTP2Data
+  , http2dataPushPromise
+  , http2dataTrailers
+  , defaultHTTP2Data
+  , getHTTP2Data
+  , setHTTP2Data
+  , modifyHTTP2Data
+    -- ** Push promise
+  , PushPromise
+  , promisedPath
+  , promisedFile
+  , promisedResponseHeaders
+  , promisedWeight
+  , defaultPushPromise
   ) where
 
 import Control.Exception (SomeException, throwIO)
@@ -114,6 +131,8 @@ import Network.Wai.Handler.Warp.Request
 import Network.Wai.Handler.Warp.Response (warpVersion)
 import Network.Wai.Handler.Warp.Run
 import Network.Wai.Handler.Warp.Settings
+import Network.Wai.Handler.Warp.HTTP2.Request (getHTTP2Data, setHTTP2Data, modifyHTTP2Data)
+import Network.Wai.Handler.Warp.HTTP2.Types
 import Network.Wai.Handler.Warp.Timeout
 import Network.Wai.Handler.Warp.Types hiding (getFileInfo)
 import Network.Wai.Handler.Warp.WithApplication
@@ -267,6 +286,16 @@ getGracefulShutdownTimeout = settingsGracefulShutdownTimeout
 -- handler. The handler should call the first argument,
 -- which closes the listen socket, at shutdown.
 --
+-- Example usage:
+--
+-- @
+-- settings :: IO () -> 'Settings'
+-- settings shutdownAction = 'setInstallShutdownHandler' shutdownHandler 'defaultSettings'
+--   __where__
+--     shutdownHandler closeSocket =
+--       void $ 'System.Posix.Signals.installHandler' 'System.Posix.Signals.sigTERM' ('System.Posix.Signals.Catch' $ shutdownAction >> closeSocket) 'Nothing'
+-- @
+--
 -- Default: does not install any code.
 --
 -- Since 3.0.1
@@ -345,7 +374,7 @@ setProxyProtocolRequired y = y { settingsProxyProtocol = ProxyProtocolRequired }
 setProxyProtocolOptional :: Settings -> Settings
 setProxyProtocolOptional y = y { settingsProxyProtocol = ProxyProtocolOptional }
 
--- | Size in bytes read to prevent Slowloris protection. Default value: 2048
+-- | Size in bytes read to prevent Slowloris attacks. Default value: 2048
 --
 -- Since 3.1.2
 setSlowlorisSize :: Int -> Settings -> Settings
@@ -357,12 +386,21 @@ setSlowlorisSize x y = y { settingsSlowlorisSize = x }
 setHTTP2Disabled :: Settings -> Settings
 setHTTP2Disabled y = y { settingsHTTP2Enabled = False }
 
--- | Setting a log function. `Integer` is the body length of a response.
+-- | Setting a log function.
 --
 -- Since 3.X.X
-setLogger :: (Request -> H.Status -> Maybe Integer -> IO ())
-          -> Settings -> Settings
+setLogger :: (Request -> H.Status -> Maybe Integer -> IO ()) -- ^ request, status, maybe file-size
+          -> Settings
+          -> Settings
 setLogger lgr y = y { settingsLogger = lgr }
+
+-- | Setting a log function for HTTP/2 server push.
+--
+--   Since: 3.2.7
+setServerPushLogger :: (Request -> ByteString -> Integer -> IO ()) -- ^ request, path, file-size
+                    -> Settings
+                    -> Settings
+setServerPushLogger lgr y = y { settingsServerPushLogger = lgr }
 
 -- | Set the graceful shutdown timeout. A timeout of `Nothing' will
 -- wait indefinitely, and a number, if provided, will be treated as seconds

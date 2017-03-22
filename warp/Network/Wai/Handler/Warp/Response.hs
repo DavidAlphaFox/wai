@@ -3,6 +3,7 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE BangPatterns #-}
 
 module Network.Wai.Handler.Warp.Response (
     sendResponse
@@ -176,7 +177,8 @@ sendResponse settings conn ii req reqidxhdr src response = do
           | isHead                  -> RspNoBody
           | otherwise               -> RspStream fb needsChunked th
         ResponseRaw raw _           -> RspRaw raw src (T.tickle th)
-    ret = case response of
+    -- Make sure we don't hang on to 'response' (avoid space leak)
+    !ret = case response of
         ResponseFile    {} -> isPersist
         ResponseBuilder {} -> isKeepAlive
         ResponseStream  {} -> isKeepAlive

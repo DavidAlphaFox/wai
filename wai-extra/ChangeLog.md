@@ -1,3 +1,35 @@
+## 3.0.19.1
+
+* All loggers follow the autoFlush setting [#604](https://github.com/yesodweb/wai/pull/604)
+
+## 3.0.19
+
+* Add a new function basicAuth', which passes request to the CheckCreds argument.
+
+## 3.0.18
+
+* ForceSSL: preserve port number when redirecting to https. [#582](https://github.com/yesodweb/wai/pull/582)
+
+## 3.0.17
+
+* Gzip pre compressed [#580](https://github.com/yesodweb/wai/pull/580)
+
+## 3.0.16.1
+
+* Fix the way the header length is checked (for limiting the max header length)
+
+## 3.0.16.0
+
+* Add a new function "parseRequestBodyEx" that allows various size limits to be set.
+
+## 3.0.15.3
+
+* Allow wai-logger 2.3
+
+## 3.0.15.2
+
+* Doc improvements
+
 ## 3.0.15.1
 
 * don't use deprecated CRT functions on Windows [#544](https://github.com/yesodweb/wai/pull/544)
