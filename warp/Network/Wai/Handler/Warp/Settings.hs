@@ -135,6 +135,7 @@ defaultSettings = Settings
     , settingsFdCacheDuration = 0
     , settingsFileInfoCacheDuration = 0
     , settingsBeforeMainLoop = return ()
+      -- 直接使用forkIOWithUnmask，这样可以让子线程处理异常
     , settingsFork = void . forkIOWithUnmask
     , settingsNoParsePath = False
     , settingsInstallShutdownHandler = const $ return ()

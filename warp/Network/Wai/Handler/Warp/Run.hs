@@ -240,7 +240,7 @@ acceptConnection set getConnMaker app counter ii0 = do
             Just (mkConn, addr) -> do
                 fork set mkConn addr app counter ii0
                 acceptLoop
-
+    -- 得到新的socket
     acceptNewConnection = do
         ex <- try getConnMaker
         case ex of
